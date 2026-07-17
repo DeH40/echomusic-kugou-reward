@@ -1,0 +1,16 @@
+{
+  "id": "echomusic",
+  "name": "EchoMusic 酷狗奖励",
+  "version": "0.3.0",
+  "description": "在 EchoMusic 中完成酷狗概念版听歌领取、广告播放上报与 VIP 状态查询",
+  "author": "OpenAI",
+  "main": "index.js",
+  "path": "echomusic",
+  "tags": ["酷狗", "签到", "听歌奖励", "广告领取"],
+  "capabilities": {
+    "kugouApi": true
+  },
+  "requires": {
+    "echoMusicVersion": ">=2.2.8-beta.7"
+  }
+}
