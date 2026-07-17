@@ -1,10 +1,11 @@
 # EchoMusic 酷狗奖励
 
-面向 EchoMusic `>=2.2.8-beta.7` 的插件，对齐 [develop202/kgcheckin](https://github.com/develop202/kgcheckin) 的概念 VIP 每日领取流程：
+面向 EchoMusic `>=2.2.8-beta.7` 的插件，对齐 [develop202/kgcheckin](https://github.com/develop202/kgcheckin) 的概念 VIP 每日领取流程，并针对 EchoMusic 的使用习惯做了自动化优化：
 
-1. **听歌回执领取**（`/youth/v2/report/listen_song` + 可选领取接口）
-2. **广告播放自动上报**（`/youth/v1/ad/play_report`，最多 8 次，默认间隔 30 秒）
-3. **VIP 状态查询**（`kugouvip.kugou.com/v1/get_union_vip`）
+1. 打开插件后自动执行签到领取与广告签到（可分别关闭）
+2. 歌曲自然播放完成后自动执行一次听歌奖励（支持 `audio ended` 与播放器状态兜底）
+3. **广告播放自动上报**（`/youth/v1/ad/play_report`，最多 8 次，默认间隔 30 秒）
+4. **VIP 状态查询**（`kugouvip.kugou.com/v1/get_union_vip`）
 
 将整个 `echomusic` 文件夹放进 EchoMusic 插件目录，刷新并启用。插件只复用当前登录态，不保存 token、userid 或 dfid。
 
@@ -12,18 +13,26 @@
 
 | 按钮 | 说明 |
 | --- | --- |
-| 一键每日任务 | 听歌领取 → 广告上报 → 查询 VIP（与 kgcheckin 主流程一致） |
+| 执行完整任务 | 听歌领取 → 广告上报 → 查询 VIP（与 kgcheckin 主流程一致） |
 | 听歌奖励 | 仅执行听歌回执 + 领取 |
-| 广告领取 | 仅执行广告 play_report 循环 |
-| 签到领取 | 仅调用 `/youth/v1/recharge/receive_vip_listen_song` |
+| 广告签到 | 仅执行广告 play_report 循环；运行中可点击“停止广告” |
+| 签到 | 仅调用 `/youth/v1/recharge/receive_vip_listen_song` |
 | 查询 VIP | 查询概念 VIP 到期时间 |
 
 ## 设置项
 
-- **启动后自动执行每日任务**：当天尚未成功跑过时，启动约 1.5 秒后自动执行一键每日任务
-- **每日任务中包含广告播放上报**：关闭后一键/自动任务会跳过广告步骤
+- **打开时自动签到**：每次打开插件约 1.2 秒后自动请求签到领取
+- **打开时自动广告签到**：每次打开插件自动开始广告上报；可以在界面中途停止，不会继续提交下一次
+- **听完一首歌自动领取**：歌曲自然结束后自动领取一次听歌奖励；当前打开周期完成后不重复触发
 - **广告次数 / 间隔秒数**：默认 `8` 次、`30` 秒，与上游一致
 - **MixSongID**：可留空；优先用输入框 → 当前播放歌曲 → 默认 `666075191`（与上游一致）
+
+## 0.4.0
+
+- 自动触发模式改为：打开时执行签到 + 广告签到，歌曲播放完成后执行听歌奖励。
+- 增加“停止广告”按钮，可中断广告等待并尝试取消当前网络请求。
+- 播放完成检测同时支持 HTML audio `ended` 事件和 Pinia 播放状态兜底。
+- 重做插件界面：状态卡片、自动化开关、快捷操作、高级设置和高对比日志面板。
 
 ## 0.3.0
 

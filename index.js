@@ -15,6 +15,8 @@ const AD_EXHAUSTED_CODE = 30002;
 const STORAGE_KEY = "echomusicState";
 const MAX_LOGS = 40;
 const MAX_REQUEST_ATTEMPTS = 3;
+const PLAYBACK_POLL_MS = 1500;
+const AUTO_TASK_DELAY_MS = 1200;
 const DEFAULT_USER_AGENT = "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi";
 const LISTEN_USER_AGENT = "Android13-1070-10566-201-0-ReportPlaySongToServerProtocol-wifi";
 
@@ -240,8 +242,21 @@ function clampInt(value, fallback, min, max) {
   return Math.min(max, Math.max(min, Math.trunc(numeric)));
 }
 
-function sleep(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+function sleep(milliseconds, signal) {
+  if (signal?.aborted) return Promise.resolve(false);
+  if (!signal) return new Promise((resolve) => setTimeout(() => resolve(true), milliseconds));
+
+  return new Promise((resolve) => {
+    let timer;
+    const finish = (completed) => {
+      clearTimeout(timer);
+      signal.removeEventListener?.("abort", onAbort);
+      resolve(completed);
+    };
+    const onAbort = () => finish(false);
+    timer = setTimeout(() => finish(true), milliseconds);
+    signal.addEventListener?.("abort", onAbort, { once: true });
+  });
 }
 
 function nonRetryableError(message) {
@@ -250,12 +265,93 @@ function nonRetryableError(message) {
   return error;
 }
 
+function cancelledError(message = "任务已停止") {
+  const error = nonRetryableError(message);
+  error.cancelled = true;
+  return error;
+}
+
+function normaliseSeconds(value, key = "") {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return 0;
+  return key.toLowerCase().includes("ms") || numeric > 10000 ? numeric / 1000 : numeric;
+}
+
+function findEntry(value, keys, depth = 0, visited = []) {
+  if (!value || typeof value !== "object" || depth > 5 || visited.length > 160) return undefined;
+  if (visited.includes(value)) return undefined;
+  visited.push(value);
+
+  for (const key of keys) {
+    if (value[key] !== undefined && value[key] !== null && value[key] !== "") {
+      return { key, value: value[key] };
+    }
+  }
+  for (const key of Object.keys(value)) {
+    const found = findEntry(value[key], keys, depth + 1, visited);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function booleanValue(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value !== "string") return undefined;
+  if (["true", "1", "playing", "play", "started"].includes(value.toLowerCase())) return true;
+  if (["false", "0", "paused", "pause", "stopped", "ended"].includes(value.toLowerCase())) return false;
+  return undefined;
+}
+
+function playbackSnapshot() {
+  const state = getPiniaState();
+  const player = firstObject([
+    state.player,
+    state.playback,
+    state.playerStore,
+    state.playbackStore,
+    state.musicPlayer,
+    state.audio,
+    state.music,
+    state,
+  ]);
+  if (!player || typeof player !== "object") return null;
+
+  const durationEntry = findEntry(player, [
+    "durationMs", "duration_ms", "totalDurationMs", "total_duration_ms", "duration", "totalDuration", "songDuration",
+  ]);
+  const positionEntry = findEntry(player, [
+    "currentTimeMs", "current_time_ms", "positionMs", "position_ms", "playedTimeMs", "played_time_ms",
+    "currentTime", "currentPosition", "position", "playedTime", "progressTime", "playTime",
+  ]);
+  const playingEntry = findEntry(player, ["isPlaying", "is_playing", "playing", "isPlay", "playState", "playStatus"]);
+  const endedEntry = findEntry(player, ["ended", "isEnded", "is_ended", "playEnded"]);
+  const trackId = currentMixsongId();
+  const duration = durationEntry ? normaliseSeconds(durationEntry.value, durationEntry.key) : 0;
+  const position = positionEntry ? normaliseSeconds(positionEntry.value, positionEntry.key) : 0;
+  const playing = playingEntry ? booleanValue(playingEntry.value) : undefined;
+  const ended = endedEntry ? booleanValue(endedEntry.value) : undefined;
+
+  if (!trackId && !duration && !position && playing === undefined && ended === undefined) return null;
+  return { trackId, duration, position, playing, ended };
+}
+
+function playbackReachedEnd(previous, current) {
+  if (!previous || !current) return false;
+  if (previous.ended === true || current.ended === true) return true;
+  const duration = current.duration || previous.duration;
+  const position = Math.max(current.position || 0, previous.position || 0);
+  if (duration > 0 && position >= Math.max(duration - 3, duration * 0.9)) return true;
+  return previous.playing === true && current.playing === false && duration > 0 && position >= duration * 0.75;
+}
+
 export default async function (ctx) {
   const { defineComponent, h, ref, onUnmounted } = ctx.vue;
   const stored = (await ctx.storage.get(STORAGE_KEY)) || {};
   const settings = {
-    autoCheckin: stored.autoCheckin !== false,
-    autoAd: stored.autoAd !== false,
+    autoOpenCheckin: stored.autoOpenCheckin ?? stored.autoCheckin !== false,
+    autoOpenAd: stored.autoOpenAd ?? stored.autoAd !== false,
+    autoListenReward: stored.autoListenReward !== false,
     mixsongId: stored.mixsongId || "",
     adMaxTimes: clampInt(stored.adMaxTimes, DEFAULT_AD_MAX_TIMES, 1, 8),
     adDelaySeconds: clampInt(stored.adDelaySeconds, DEFAULT_AD_DELAY_SECONDS, 5, 120),
@@ -263,6 +359,15 @@ export default async function (ctx) {
   const logs = Array.isArray(stored.logs) ? stored.logs.slice(-MAX_LOGS) : [];
   let lastCheckinDate = stored.lastCheckinDate || "";
   let running = false;
+  let adRunning = false;
+  let adStopRequested = false;
+  let adController = null;
+  let adRunToken = 0;
+  let autoListenHandled = false;
+  let pendingListenRewardId = "";
+  let autoListenQueued = false;
+  let lastAutoListenEventKey = "";
+  let lastAutoListenEventAt = 0;
   let statusText = "就绪";
   let logVersion = 0;
   const statusListeners = new Set();
@@ -279,8 +384,12 @@ export default async function (ctx) {
 
   const saveState = async () => {
     await ctx.storage.set(STORAGE_KEY, {
-      autoCheckin: settings.autoCheckin,
-      autoAd: settings.autoAd,
+      autoOpenCheckin: settings.autoOpenCheckin,
+      autoOpenAd: settings.autoOpenAd,
+      autoListenReward: settings.autoListenReward,
+      // 保留旧字段，便于 0.3.x 升级后继续识别已有配置。
+      autoCheckin: settings.autoOpenCheckin,
+      autoAd: settings.autoOpenAd,
       mixsongId: settings.mixsongId,
       adMaxTimes: settings.adMaxTimes,
       adDelaySeconds: settings.adDelaySeconds,
@@ -313,6 +422,7 @@ export default async function (ctx) {
     data,
     headers = {},
     acceptedErrorCodes = [],
+    signal,
   }) => {
     const auth = getAuth();
     const clienttime = Math.floor(Date.now() / 1000);
@@ -348,6 +458,7 @@ export default async function (ctx) {
             clienttime: String(allParams.clienttime),
             ...headers,
           },
+          ...(signal ? { signal } : {}),
           ...(data === undefined ? {} : { body }),
         });
 
@@ -370,6 +481,7 @@ export default async function (ctx) {
         if (isFailedResponse(payload)) throw nonRetryableError(responseMessage(payload));
         return payload;
       } catch (error) {
+        if (signal?.aborted) throw cancelledError("广告签到已停止");
         lastError = error;
         if (error?.retryable === false || attempt === MAX_REQUEST_ATTEMPTS) throw error;
         const waitSeconds = attempt;
@@ -452,49 +564,105 @@ export default async function (ctx) {
    * 每天最多 8 次，成功后间隔等待再领下一次；error_code 30002 表示今日次数用尽。
    */
   const adReward = async () => {
-    const maxTimes = clampInt(settings.adMaxTimes, DEFAULT_AD_MAX_TIMES, 1, 8);
-    const delaySeconds = clampInt(settings.adDelaySeconds, DEFAULT_AD_DELAY_SECONDS, 5, 120);
-    let claimCount = 0;
-    let claimTotal = 0;
-
-    await addLog(`开始广告播放上报，最多 ${maxTimes} 次，间隔 ${delaySeconds} 秒`);
-
-    for (let index = 1; index <= maxTimes; index += 1) {
-      claimTotal = index;
-      setStatus(`正在广告领取（${index}/${maxTimes}）…`);
-      const now = Date.now();
-      const payload = await request({
-        path: "/youth/v1/ad/play_report",
-        method: "POST",
-        data: {
-          ad_id: AD_ID,
-          play_end: now,
-          play_start: now - AD_PLAY_MS,
-        },
-        headers: {
-          "Content-Type": "application/json; charset=utf-8",
-        },
-        acceptedErrorCodes: [AD_EXHAUSTED_CODE],
-      });
-
-      if (Number(payload?.error_code) === AD_EXHAUSTED_CODE) {
-        await addLog(`第 ${index} 次广告领取：今天次数已用光`);
-        break;
-      }
-
-      claimCount += 1;
-      await addLog(resultSummary(`第 ${index} 次广告领取成功`, payload));
-
-      if (index < maxTimes) {
-        setStatus(`广告领取成功，等待 ${delaySeconds} 秒后继续（${index}/${maxTimes}）…`);
-        await addLog(`等待 ${delaySeconds} 秒后进行下一次广告上报…`);
-        await sleep(delaySeconds * 1000);
-      }
+    if (adRunning) {
+      notify("info", "广告签到已经在执行中");
+      return { claimCount: 0, claimTotal: 0, stopped: false };
     }
 
-    await addLog(`广告领取完成：成功 ${claimCount}/${claimTotal} 次`);
-    notify("success", `广告领取完成：${claimCount}/${claimTotal}`);
-    return { claimCount, claimTotal };
+    const maxTimes = clampInt(settings.adMaxTimes, DEFAULT_AD_MAX_TIMES, 1, 8);
+    const delaySeconds = clampInt(settings.adDelaySeconds, DEFAULT_AD_DELAY_SECONDS, 5, 120);
+    const runToken = ++adRunToken;
+    adStopRequested = false;
+    adController = typeof AbortController === "function" ? new AbortController() : null;
+    adRunning = true;
+    let claimCount = 0;
+    let claimTotal = 0;
+    let stopped = false;
+
+    try {
+      await addLog(`开始广告播放上报，最多 ${maxTimes} 次，间隔 ${delaySeconds} 秒`);
+
+      for (let index = 1; index <= maxTimes; index += 1) {
+        if (adStopRequested || runToken !== adRunToken) {
+          stopped = true;
+          await addLog("广告签到已停止，不再提交下一次广告上报");
+          break;
+        }
+
+        claimTotal = index;
+        setStatus(`正在广告领取（${index}/${maxTimes}）…`);
+        const now = Date.now();
+        let payload;
+        try {
+          payload = await request({
+            path: "/youth/v1/ad/play_report",
+            method: "POST",
+            data: {
+              ad_id: AD_ID,
+              play_end: now,
+              play_start: now - AD_PLAY_MS,
+            },
+            headers: {
+              "Content-Type": "application/json; charset=utf-8",
+            },
+            acceptedErrorCodes: [AD_EXHAUSTED_CODE],
+            signal: adController?.signal,
+          });
+        } catch (error) {
+          if (error?.cancelled || adStopRequested || runToken !== adRunToken) {
+            stopped = true;
+            await addLog("广告签到已停止，当前请求未继续重试");
+            break;
+          }
+          throw error;
+        }
+
+        if (Number(payload?.error_code) === AD_EXHAUSTED_CODE) {
+          await addLog(`第 ${index} 次广告领取：今天次数已用光`);
+          break;
+        }
+
+        claimCount += 1;
+        await addLog(resultSummary(`第 ${index} 次广告领取成功`, payload));
+
+        if (index < maxTimes) {
+          if (adStopRequested || runToken !== adRunToken) {
+            stopped = true;
+            await addLog("广告签到已停止，不再等待下一次上报");
+            break;
+          }
+          setStatus(`广告领取成功，等待 ${delaySeconds} 秒后继续（${index}/${maxTimes}）…`);
+          await addLog(`等待 ${delaySeconds} 秒后进行下一次广告上报…`);
+          const completed = await sleep(delaySeconds * 1000, adController?.signal);
+          if (!completed || adStopRequested || runToken !== adRunToken) {
+            stopped = true;
+            await addLog("广告签到已停止，不再提交下一次广告上报");
+            break;
+          }
+        }
+      }
+
+      await addLog(`广告领取${stopped ? "已停止" : "完成"}：成功 ${claimCount}/${claimTotal} 次`);
+      notify(stopped ? "info" : "success", `广告领取${stopped ? "已停止" : "完成"}：${claimCount}/${claimTotal}`);
+      return { claimCount, claimTotal, stopped };
+    } finally {
+      adRunning = false;
+      adStopRequested = false;
+      adController = null;
+    }
+  };
+
+  const stopAdReward = () => {
+    if (!adRunning) {
+      notify("info", "当前没有正在执行的广告签到");
+      return false;
+    }
+    adStopRequested = true;
+    adRunToken += 1;
+    adController?.abort?.();
+    setStatus("正在停止广告签到…");
+    void addLog("收到停止广告签到请求");
+    return true;
   };
 
   const queryVip = async () => {
@@ -512,6 +680,39 @@ export default async function (ctx) {
     return formatted;
   };
 
+  let drainPendingListenReward = () => {};
+
+  /** 打开 EchoMusic 后执行的轻量自动流程：签到领取 + 广告签到。 */
+  const openTasks = async () => {
+    await addLog("======== 开始打开时自动任务 ========");
+    let completed = 0;
+
+    if (settings.autoOpenCheckin) {
+      try {
+        await checkIn();
+        completed += 1;
+      } catch (error) {
+        await addLog(`打开时自动签到失败：${error?.message || error}`);
+      }
+    } else {
+      await addLog("已关闭打开时自动签到，跳过签到领取");
+    }
+
+    if (settings.autoOpenAd) {
+      try {
+        const result = await adReward();
+        if (!result?.stopped) completed += 1;
+      } catch (error) {
+        await addLog(`打开时自动广告签到失败：${error?.message || error}`);
+      }
+    } else {
+      await addLog("已关闭打开时自动广告签到，跳过广告上报");
+    }
+
+    await addLog(`打开时自动任务结束：完成 ${completed}/2 项`);
+    notify("success", `打开时自动任务完成：${completed}/2 项`);
+  };
+
   /**
    * 对齐 kgcheckin main.js 的每日流程：
    * 1) 听歌领取  2) 广告上报最多 8 次  3) 查询 VIP
@@ -521,7 +722,7 @@ export default async function (ctx) {
     setStatus("每日任务：听歌领取…");
     await listenReward(configuredMixsongId);
 
-    if (settings.autoAd) {
+    if (settings.autoOpenAd) {
       setStatus("每日任务：广告领取…");
       await adReward();
     } else {
@@ -540,23 +741,137 @@ export default async function (ctx) {
   const run = async (task, argument) => {
     if (running) {
       notify("info", "已有任务正在执行");
-      return;
+      return false;
     }
     running = true;
+    let succeeded = false;
     try {
       if (task === "daily") await dailyAll(argument);
-      if (task === "checkin") await checkIn();
-      if (task === "listen") await listenReward(argument);
-      if (task === "ad") await adReward();
-      if (task === "vip") await queryVip();
+      else if (task === "open") await openTasks();
+      else if (task === "checkin") await checkIn();
+      else if (task === "listen") await listenReward(argument);
+      else if (task === "ad") await adReward();
+      else if (task === "vip") await queryVip();
+      succeeded = true;
     } catch (error) {
       const message = error?.message || String(error);
       await addLog(`失败：${message}`);
-      notify("danger", message);
+      if (!error?.cancelled) notify("danger", message);
     } finally {
       running = false;
       setStatus("就绪");
+      setTimeout(() => drainPendingListenReward(), 0);
     }
+    return succeeded;
+  };
+
+  const queueAutoListenReward = (mixsongId, source = "播放完成") => {
+    if (!settings.autoListenReward || autoListenHandled) return;
+
+    const resolvedId = validMixsongId(mixsongId)
+      || currentMixsongId()
+      || validMixsongId(settings.mixsongId)
+      || DEFAULT_MIXSONG_ID;
+    const now = Date.now();
+    const eventKey = `${resolvedId}:${source}`;
+    if (eventKey === lastAutoListenEventKey && now - lastAutoListenEventAt < 5000) return;
+    lastAutoListenEventKey = eventKey;
+    lastAutoListenEventAt = now;
+    pendingListenRewardId = resolvedId;
+    setStatus("已听完一首歌，准备领取听歌奖励…");
+    void addLog(`检测到${source}，已排队自动领取听歌奖励（${resolvedId}）`);
+    drainPendingListenReward();
+  };
+
+  drainPendingListenReward = () => {
+    if (!settings.autoListenReward || autoListenHandled || autoListenQueued || running || !pendingListenRewardId) return;
+
+    const mixsongId = pendingListenRewardId;
+    pendingListenRewardId = "";
+    autoListenQueued = true;
+    void run("listen", mixsongId).then((succeeded) => {
+      autoListenQueued = false;
+      if (succeeded) {
+        autoListenHandled = true;
+        void addLog("本次自动听歌奖励已完成，当前打开周期不再重复触发");
+      }
+      drainPendingListenReward();
+    });
+  };
+
+  let playbackWatcherStarted = false;
+
+  const startPlaybackWatcher = () => {
+    if (playbackWatcherStarted || typeof document === "undefined") return;
+    playbackWatcherStarted = true;
+
+    const attachedAudios = new WeakSet();
+    const audioStates = new WeakMap();
+    let previousSnapshot = null;
+
+    const attachAudio = (audio) => {
+      if (!audio || typeof audio.addEventListener !== "function" || attachedAudios.has(audio)) return;
+      attachedAudios.add(audio);
+      const state = { mixsongId: "" };
+      audioStates.set(audio, state);
+
+      const onPlay = () => {
+        state.mixsongId = currentMixsongId();
+      };
+      const onEnded = () => {
+        queueAutoListenReward(state.mixsongId || currentMixsongId(), "歌曲播放完成");
+      };
+      audio.addEventListener("play", onPlay);
+      audio.addEventListener("ended", onEnded);
+    };
+
+    const scanAudios = () => {
+      try {
+        document.querySelectorAll?.("audio").forEach(attachAudio);
+      } catch {
+        // 某些旧版 WebView 在页面切换时可能短暂无法查询 DOM。
+      }
+    };
+
+    scanAudios();
+    let observer;
+    try {
+      if (typeof MutationObserver === "function" && document.documentElement) {
+        observer = new MutationObserver(scanAudios);
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+      }
+    } catch {
+      observer = undefined;
+    }
+
+    const pollTimer = setInterval(() => {
+      scanAudios();
+      const currentSnapshot = playbackSnapshot();
+      if (!currentSnapshot) return;
+
+      if (previousSnapshot) {
+        const switchedSong = Boolean(
+          previousSnapshot.trackId && currentSnapshot.trackId && previousSnapshot.trackId !== currentSnapshot.trackId,
+        );
+        const endedNow = currentSnapshot.ended === true && previousSnapshot.ended !== true;
+        const stoppedAtEnd = Boolean(
+          previousSnapshot.trackId && currentSnapshot.trackId &&
+          previousSnapshot.trackId === currentSnapshot.trackId &&
+          previousSnapshot.playing === true && currentSnapshot.playing === false &&
+          playbackReachedEnd(previousSnapshot, currentSnapshot),
+        );
+
+        if ((switchedSong && playbackReachedEnd(previousSnapshot, currentSnapshot)) || endedNow || stoppedAtEnd) {
+          queueAutoListenReward(previousSnapshot.trackId || currentSnapshot.trackId, "播放器状态完成");
+        }
+      }
+      previousSnapshot = currentSnapshot;
+    }, PLAYBACK_POLL_MS);
+
+    // 插件宿主没有统一的卸载钩子；定时器保持与插件实例同生命周期，避免关闭设置面板后丢失自动触发。
+    void observer;
+    void audioStates;
+    void pollTimer;
   };
 
   const component = defineComponent({
@@ -564,8 +879,9 @@ export default async function (ctx) {
     setup() {
       const status = ref(statusText);
       const mixsongId = ref(settings.mixsongId);
-      const autoCheckin = ref(settings.autoCheckin);
-      const autoAd = ref(settings.autoAd);
+      const autoOpenCheckin = ref(settings.autoOpenCheckin);
+      const autoOpenAd = ref(settings.autoOpenAd);
+      const autoListenReward = ref(settings.autoListenReward);
       const adMaxTimes = ref(String(settings.adMaxTimes));
       const adDelaySeconds = ref(String(settings.adDelaySeconds));
       const logTick = ref(logVersion);
@@ -591,15 +907,21 @@ export default async function (ctx) {
         await saveState();
       };
 
-      const updateAutoCheckin = async (event) => {
-        autoCheckin.value = Boolean(event?.target?.checked);
-        settings.autoCheckin = autoCheckin.value;
+      const updateAutoOpenCheckin = async (event) => {
+        autoOpenCheckin.value = Boolean(event?.target?.checked);
+        settings.autoOpenCheckin = autoOpenCheckin.value;
         await saveState();
       };
 
-      const updateAutoAd = async (event) => {
-        autoAd.value = Boolean(event?.target?.checked);
-        settings.autoAd = autoAd.value;
+      const updateAutoOpenAd = async (event) => {
+        autoOpenAd.value = Boolean(event?.target?.checked);
+        settings.autoOpenAd = autoOpenAd.value;
+        await saveState();
+      };
+
+      const updateAutoListenReward = async (event) => {
+        autoListenReward.value = Boolean(event?.target?.checked);
+        settings.autoListenReward = autoListenReward.value;
         await saveState();
       };
 
@@ -618,29 +940,45 @@ export default async function (ctx) {
       };
 
       const buttonStyle = {
+        minHeight: "38px",
         padding: "8px 14px",
         border: "0",
-        borderRadius: "7px",
+        borderRadius: "10px",
         background: "#2563eb",
         color: "#ffffff",
         fontSize: "13px",
         fontWeight: "600",
         cursor: "pointer",
-        boxShadow: "0 1px 2px rgba(0, 0, 0, 0.16)",
+        boxShadow: "0 4px 12px rgba(37, 99, 235, 0.22)",
+        transition: "opacity 160ms ease, transform 160ms ease",
       };
 
       const secondaryButtonStyle = {
         ...buttonStyle,
         background: "#0f766e",
+        boxShadow: "0 4px 12px rgba(15, 118, 110, 0.2)",
+      };
+
+      const quietButtonStyle = {
+        ...buttonStyle,
+        background: "rgba(107, 114, 128, 0.16)",
+        color: "inherit",
+        boxShadow: "none",
+      };
+
+      const dangerButtonStyle = {
+        ...buttonStyle,
+        background: "#b42318",
+        boxShadow: "0 4px 12px rgba(180, 35, 24, 0.2)",
       };
 
       const inputStyle = {
         width: "100%",
         boxSizing: "border-box",
-        padding: "9px 11px",
-        border: "1px solid #9ca3af",
-        borderRadius: "7px",
-        background: "#ffffff",
+        padding: "10px 12px",
+        border: "1px solid rgba(148, 163, 184, 0.55)",
+        borderRadius: "9px",
+        background: "rgba(255, 255, 255, 0.72)",
         color: "#111827",
         fontSize: "14px",
         outline: "none",
@@ -648,103 +986,167 @@ export default async function (ctx) {
 
       const smallInputStyle = {
         ...inputStyle,
-        width: "72px",
-        display: "inline-block",
-        margin: "0 6px",
-        padding: "6px 8px",
+        width: "84px",
+        padding: "8px 9px",
       };
 
-      const labelStyle = {
-        display: "block",
-        margin: "10px 0",
-        color: "inherit",
-        fontSize: "13px",
+      const cardStyle = {
+        padding: "14px",
+        border: "1px solid rgba(148, 163, 184, 0.25)",
+        borderRadius: "14px",
+        background: "rgba(148, 163, 184, 0.08)",
       };
 
-      return () => h("div", { style: { padding: "16px", lineHeight: "1.6", color: "inherit" } }, [
-        h("h3", { style: { margin: "0 0 8px", color: "inherit", fontWeight: "700" } }, "EchoMusic 酷狗奖励"),
-        h("p", {
-          style: { color: "inherit", opacity: "0.78", fontSize: "13px", margin: "0 0 8px" },
-        }, "复用当前登录态完成概念 VIP 听歌领取与广告播放上报；不保存 token，也不提供会员播放解锁。"),
-        h("p", {
-          style: { color: "inherit", opacity: "0.72", fontSize: "12px", margin: "0 0 4px" },
-        }, "对齐 develop202/kgcheckin：听歌回执 + 广告 play_report（最多 8 次）+ VIP 查询。"),
-        h("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap", margin: "12px 0" } }, [
-          h("button", { onClick: () => execute("daily"), disabled: running, style: secondaryButtonStyle }, "一键每日任务"),
-          h("button", { onClick: () => execute("listen"), disabled: running, style: buttonStyle }, "听歌奖励"),
-          h("button", { onClick: () => execute("ad"), disabled: running, style: buttonStyle }, "广告领取"),
-          h("button", { onClick: () => execute("checkin"), disabled: running, style: buttonStyle }, "签到领取"),
-          h("button", { onClick: () => execute("vip"), disabled: running, style: buttonStyle }, "查询 VIP"),
+      const toggleCard = (title, description, checked, onChange, accent) => h("label", {
+        style: {
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: "14px",
+          padding: "12px 13px",
+          border: "1px solid rgba(148, 163, 184, 0.22)",
+          borderRadius: "11px",
+          background: "rgba(255, 255, 255, 0.08)",
+          cursor: "pointer",
+        },
+      }, [
+        h("span", { style: { minWidth: "0", display: "block" } }, [
+          h("span", { style: { display: "block", fontSize: "13px", fontWeight: "700" } }, title),
+          h("span", { style: { display: "block", marginTop: "2px", fontSize: "12px", opacity: "0.66", lineHeight: "1.45" } }, description),
         ]),
         h("input", {
-          type: "text",
-          value: mixsongId.value,
-          placeholder: `MixSongID（可留空：自动读取 / 默认 ${DEFAULT_MIXSONG_ID}）`,
-          onInput: updateMixsongId,
-          style: inputStyle,
+          type: "checkbox",
+          checked,
+          onChange,
+          "aria-label": title,
+          style: { width: "19px", height: "19px", flex: "0 0 auto", accentColor: accent, cursor: "pointer" },
         }),
-        h("label", { style: labelStyle }, [
-          h("input", { type: "checkbox", checked: autoCheckin.value, onChange: updateAutoCheckin, style: { accentColor: "#2563eb" } }),
-          " 启动后自动执行每日任务（听歌 + 广告）",
+      ]);
+
+      const actionButton = (label, task, style = buttonStyle) => h("button", {
+        type: "button",
+        onClick: () => execute(task),
+        disabled: running,
+        style: { ...style, opacity: running ? "0.52" : "1", cursor: running ? "not-allowed" : "pointer" },
+      }, label);
+
+      const stopButton = () => h("button", {
+        type: "button",
+        onClick: stopAdReward,
+        disabled: !adRunning,
+        style: {
+          ...dangerButtonStyle,
+          opacity: adRunning ? "1" : "0.42",
+          cursor: adRunning ? "pointer" : "not-allowed",
+        },
+        title: "立即停止当前广告签到循环",
+      }, adRunning ? "停止广告" : "停止广告（未运行）");
+
+      const sectionTitle = (title, description) => h("div", { style: { marginBottom: "10px" } }, [
+        h("div", { style: { fontSize: "14px", fontWeight: "800" } }, title),
+        description ? h("div", { style: { marginTop: "2px", fontSize: "12px", opacity: "0.62" } }, description) : null,
+      ]);
+
+      const statusTone = () => {
+        if (adRunning) return { color: "#d97706", background: "rgba(245, 158, 11, 0.12)" };
+        if (running) return { color: "#2563eb", background: "rgba(37, 99, 235, 0.12)" };
+        return { color: "#15803d", background: "rgba(34, 197, 94, 0.12)" };
+      };
+
+      return () => h("div", {
+        style: {
+          maxWidth: "720px",
+          margin: "0 auto",
+          padding: "18px",
+          color: "inherit",
+          lineHeight: "1.55",
+          fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+        },
+      }, [
+        h("div", { style: { ...cardStyle, padding: "17px", background: "linear-gradient(135deg, rgba(37, 99, 235, 0.14), rgba(15, 118, 110, 0.08))" } }, [
+          h("div", { style: { display: "flex", alignItems: "flex-start", gap: "12px" } }, [
+            h("div", { style: { width: "42px", height: "42px", display: "grid", placeItems: "center", flex: "0 0 auto", borderRadius: "13px", background: "#2563eb", color: "#ffffff", fontSize: "24px", fontWeight: "800", boxShadow: "0 8px 18px rgba(37, 99, 235, 0.25)" } }, "♫"),
+            h("div", { style: { minWidth: "0", flex: "1" } }, [
+              h("div", { style: { fontSize: "10px", letterSpacing: "0.12em", fontWeight: "800", opacity: "0.58" } }, "ECHOMUSIC · REWARD"),
+              h("h2", { style: { margin: "3px 0 3px", fontSize: "21px", lineHeight: "1.2", fontWeight: "800" } }, "酷狗奖励助手"),
+              h("p", { style: { margin: "0", fontSize: "12px", opacity: "0.72" } }, "打开自动签到与广告，听完一首歌自动领取听歌奖励"),
+            ]),
+            h("span", { style: { flex: "0 0 auto", padding: "4px 8px", borderRadius: "999px", background: "rgba(255, 255, 255, 0.55)", fontSize: "11px", fontWeight: "800" } }, (settings.autoOpenCheckin || settings.autoOpenAd || settings.autoListenReward) ? "自动运行" : "手动模式"),
+          ]),
+          h("div", { style: { display: "flex", flexWrap: "wrap", gap: "7px", marginTop: "15px" } }, [
+            h("span", { style: { padding: "5px 9px", borderRadius: "8px", background: "rgba(255, 255, 255, 0.48)", fontSize: "12px" } }, "打开：签到 + 广告"),
+            h("span", { style: { padding: "5px 9px", borderRadius: "8px", background: "rgba(255, 255, 255, 0.48)", fontSize: "12px" } }, "听完：听歌奖励"),
+            h("span", { style: { padding: "5px 9px", borderRadius: "8px", background: "rgba(255, 255, 255, 0.48)", fontSize: "12px" } }, `广告：${settings.adMaxTimes} 次`),
+          ]),
         ]),
-        h("label", { style: labelStyle }, [
-          h("input", { type: "checkbox", checked: autoAd.value, onChange: updateAutoAd, style: { accentColor: "#0f766e" } }),
-          " 每日任务中包含广告播放上报",
+        h("div", { style: { ...cardStyle, ...statusTone(), display: "flex", alignItems: "center", gap: "9px", marginTop: "12px", padding: "11px 13px" } }, [
+          h("span", { style: { width: "9px", height: "9px", flex: "0 0 auto", borderRadius: "50%", background: statusTone().color, boxShadow: `0 0 0 4px ${statusTone().background}` } }),
+          h("span", { style: { fontSize: "13px", fontWeight: "700" } }, `状态：${status.value}`),
+          h("span", { style: { marginLeft: "auto", fontSize: "11px", opacity: "0.7" } }, adRunning ? "可随时停止广告" : running ? "请稍候" : "已就绪"),
         ]),
-        h("div", { style: { ...labelStyle, display: "flex", alignItems: "center", flexWrap: "wrap", gap: "4px" } }, [
-          h("span", null, "广告次数"),
-          h("input", {
-            type: "number",
-            min: "1",
-            max: "8",
-            value: adMaxTimes.value,
-            onInput: updateAdMaxTimes,
-            style: smallInputStyle,
-          }),
-          h("span", null, "次，间隔"),
-          h("input", {
-            type: "number",
-            min: "5",
-            max: "120",
-            value: adDelaySeconds.value,
-            onInput: updateAdDelaySeconds,
-            style: smallInputStyle,
-          }),
-          h("span", null, "秒（对齐上游默认 8×30s）"),
+        h("div", { style: { ...cardStyle, marginTop: "12px" } }, [
+          sectionTitle("快捷操作", "手动任务会复用当前登录态；广告循环可随时停止。"),
+          h("div", { style: { display: "flex", flexWrap: "wrap", gap: "8px" } }, [
+            actionButton("执行完整任务", "daily", secondaryButtonStyle),
+            actionButton("签到", "checkin", buttonStyle),
+            actionButton("广告签到", "ad", buttonStyle),
+            actionButton("听歌奖励", "listen", buttonStyle),
+            actionButton("VIP 查询", "vip", quietButtonStyle),
+            stopButton(),
+          ]),
         ]),
-        h("div", {
-          style: {
-            marginTop: "10px",
-            padding: "7px 10px",
-            borderRadius: "6px",
-            background: "rgba(107, 114, 128, 0.12)",
-            color: "inherit",
-            fontSize: "13px",
-            fontWeight: "600",
-          },
-        }, `状态：${status.value}`),
-        h("div", { style: { margin: "14px 0 6px", color: "inherit", fontSize: "13px", fontWeight: "700" } }, "运行日志"),
-        h("pre", {
-          key: logTick.value,
-          style: {
-            boxSizing: "border-box",
-            minHeight: "82px",
-            maxHeight: "280px",
-            margin: "0",
-            padding: "12px 14px",
-            overflowY: "auto",
-            whiteSpace: "pre-wrap",
-            overflowWrap: "anywhere",
-            border: "1px solid #374151",
-            borderRadius: "8px",
-            background: "#111827",
-            color: "#f9fafb",
-            fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-            fontSize: "13px",
-            lineHeight: "1.65",
-            textShadow: "none",
-          },
-        }, logs.join("\n") || "暂无日志"),
+        h("div", { style: { ...cardStyle, marginTop: "12px" } }, [
+          sectionTitle("自动化", "默认开启；酷狗接口今日已领取时会自动返回提示，不会重复增加奖励。"),
+          h("div", { style: { display: "grid", gap: "8px" } }, [
+            toggleCard("打开时自动签到", "每次打开插件后自动请求签到领取。", autoOpenCheckin.value, updateAutoOpenCheckin, "#2563eb"),
+            toggleCard("打开时自动广告签到", "打开插件后开始广告上报，可点击红色按钮立即停止。", autoOpenAd.value, updateAutoOpenAd, "#0f766e"),
+            toggleCard("听完一首歌自动领取", "检测歌曲自然结束后领取一次听歌奖励；本次打开周期不重复触发。", autoListenReward.value, updateAutoListenReward, "#7c3aed"),
+          ]),
+        ]),
+        h("details", { style: { ...cardStyle, marginTop: "12px" } }, [
+          h("summary", { style: { cursor: "pointer", fontSize: "14px", fontWeight: "800" } }, "高级设置"),
+          h("div", { style: { marginTop: "13px" } }, [
+            h("label", { style: { display: "block", fontSize: "12px", fontWeight: "700", opacity: "0.72" } }, "MixSongID（可留空，自动读取当前歌曲）"),
+            h("input", {
+              type: "text",
+              value: mixsongId.value,
+              placeholder: `自动读取 / 默认 ${DEFAULT_MIXSONG_ID}`,
+              onInput: updateMixsongId,
+              style: { ...inputStyle, marginTop: "6px" },
+            }),
+            h("div", { style: { display: "flex", flexWrap: "wrap", alignItems: "center", gap: "8px", marginTop: "12px", fontSize: "13px" } }, [
+              h("span", { style: { opacity: "0.72" } }, "广告次数"),
+              h("input", { type: "number", min: "1", max: "8", value: adMaxTimes.value, onInput: updateAdMaxTimes, style: smallInputStyle, "aria-label": "广告次数" }),
+              h("span", { style: { opacity: "0.72" } }, "次；间隔"),
+              h("input", { type: "number", min: "5", max: "120", value: adDelaySeconds.value, onInput: updateAdDelaySeconds, style: smallInputStyle, "aria-label": "广告间隔秒数" }),
+              h("span", { style: { opacity: "0.62", fontSize: "12px" } }, "秒（默认 8 × 30 秒）"),
+            ]),
+          ]),
+        ]),
+        h("div", { style: { marginTop: "14px" } }, [
+          sectionTitle("运行日志", "仅保存最近 40 条，不保存 token、userid 或 dfid。"),
+          h("pre", {
+            key: logTick.value,
+            style: {
+              boxSizing: "border-box",
+              minHeight: "96px",
+              maxHeight: "280px",
+              margin: "0",
+              padding: "12px 13px",
+              overflowY: "auto",
+              whiteSpace: "pre-wrap",
+              overflowWrap: "anywhere",
+              border: "1px solid rgba(30, 41, 59, 0.8)",
+              borderRadius: "11px",
+              background: "#0f172a",
+              color: "#e2e8f0",
+              fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+              fontSize: "12px",
+              lineHeight: "1.65",
+              textShadow: "none",
+            },
+          }, logs.join("\n") || "暂无日志"),
+        ]),
       ]);
     },
   });
@@ -752,11 +1154,13 @@ export default async function (ctx) {
   ctx.ui.settings.define({
     id: "default",
     title: "酷狗奖励",
-    description: "听歌领取、广告上报与 VIP 状态",
+    description: "打开自动签到，听完歌曲自动领取奖励",
     component,
   });
 
-  if (settings.autoCheckin && lastCheckinDate !== todayKey()) {
-    setTimeout(() => run("daily"), 1500);
+  startPlaybackWatcher();
+
+  if (settings.autoOpenCheckin || settings.autoOpenAd) {
+    setTimeout(() => run("open"), AUTO_TASK_DELAY_MS);
   }
 }
