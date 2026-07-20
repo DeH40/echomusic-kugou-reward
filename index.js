@@ -1065,10 +1065,66 @@ class PluginRuntime {
                 ["autoDailyClaim", "启动时补领每日奖励", "EchoMusic 登录态就绪后，每个自然日只检查一次。"],
                 ["autoAd", "启动时补领广告奖励", `最多 ${data.settings.adMaxTimes} 次，间隔 ${data.settings.adDelaySeconds} 秒；运行中可停止。`],
                 ["autoListenReward", "听完歌曲自动上报", "只响应官方 onEnded 事件，同一播放会话不会重复上报。"],
-              ].map(([name, title, description]) => h("label", { key: name, style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "14px", padding: "10px 11px", borderTop: "1px solid var(--border-subtle, rgba(128, 128, 128, .12))", cursor: "pointer" } }, [
-                h("span", { style: { minWidth: "0" } }, [h("span", { style: { display: "block", fontSize: "13px", fontWeight: "700" } }, title), h("span", { style: { display: "block", marginTop: "2px", fontSize: "12px", opacity: ".62" } }, description)]),
-                h("input", { type: "checkbox", checked: Boolean(data.settings[name]), onChange: (event) => runtime.updateSetting(name, Boolean(event.target.checked)), "aria-label": title, style: { width: "19px", height: "19px", flex: "0 0 auto", accentColor: "var(--color-primary, #31cfa1)" } }),
-              ])),
+              ].map(([name, title, description]) => {
+                const checked = Boolean(data.settings[name]);
+                return h("button", {
+                  key: name,
+                  type: "button",
+                  role: "switch",
+                  "aria-checked": checked,
+                  "aria-label": title,
+                  onClick: () => runtime.updateSetting(name, !checked),
+                  style: {
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "14px",
+                    width: "100%",
+                    boxSizing: "border-box",
+                    padding: "10px 11px",
+                    border: "0",
+                    borderTop: "1px solid var(--border-subtle, rgba(128, 128, 128, .12))",
+                    borderRadius: "0",
+                    background: "transparent",
+                    color: "inherit",
+                    textAlign: "left",
+                    cursor: "pointer",
+                    appearance: "none",
+                    WebkitAppearance: "none",
+                  },
+                }, [
+                  h("span", { style: { minWidth: "0", flex: "1" } }, [
+                    h("span", { style: { display: "block", fontSize: "13px", fontWeight: "700" } }, title),
+                    h("span", { style: { display: "block", marginTop: "2px", fontSize: "12px", opacity: ".62" } }, description),
+                  ]),
+                  h("span", {
+                    "aria-hidden": "true",
+                    style: {
+                      position: "relative",
+                      display: "block",
+                      width: "42px",
+                      height: "24px",
+                      flex: "0 0 42px",
+                      borderRadius: "999px",
+                      background: checked ? "var(--color-primary, #31cfa1)" : "var(--control-track-bg, rgba(128, 128, 128, .28))",
+                      boxShadow: checked ? "inset 0 0 0 1px rgba(0, 0, 0, .08)" : "inset 0 0 0 1px rgba(128, 128, 128, .22)",
+                      transition: "background .16s ease",
+                    },
+                  }, [h("span", {
+                    style: {
+                      position: "absolute",
+                      top: "3px",
+                      left: checked ? "21px" : "3px",
+                      width: "18px",
+                      height: "18px",
+                      borderRadius: "50%",
+                      background: "#ffffff",
+                      boxShadow: "0 1px 4px rgba(0, 0, 0, .25)",
+                      transition: "left .16s ease",
+                    },
+                  })]),
+                ]);
+              }),
             ], { marginTop: "12px" }),
             h("details", { style: { marginTop: "12px", padding: "14px 15px", border: "1px solid var(--border-subtle, rgba(128, 128, 128, .16))", borderRadius: "15px", background: "var(--color-bg-elevated, rgba(128, 128, 128, .06))" } }, [
               h("summary", { style: { cursor: "pointer", fontSize: "14px", fontWeight: "800" } }, "高级设置与诊断"),
