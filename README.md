@@ -127,6 +127,16 @@ EchoMusic 插件目录/
 - **没有自动执行**：先确认插件已启用、EchoMusic 已登录酷狗，再到插件设置检查三个自动化开关。广告任务运行时可以点击“停止全部任务”。
 - **不想使用在线源**：使用上面的手动安装方式即可，整个插件没有 npm 依赖。
 
+## 参考项目
+
+本插件的 EchoMusic 插件接入方式和在线插件源索引格式参考了以下项目：
+
+- [EchoMusic](https://github.com/hoowhoami/EchoMusic)：参考官方插件运行时提供的播放器事件、插件激活/卸载生命周期以及插件管理流程。
+- [EchoMusicPlugins](https://github.com/hoowhoami/EchoMusicPlugins)：参考官方 `echo-plugins.json` 的仓库索引结构、`path` / `repo` 用法和插件清单组织方式。
+- [EchoMusicPlugins 的 echo-plugins.json](https://raw.githubusercontent.com/hoowhoami/EchoMusicPlugins/HEAD/echo-plugins.json)：可直接查看官方插件源当前使用的索引示例。
+
+本项目根据上述公开接口和格式实现酷狗奖励功能，业务请求、任务账本和界面代码均属于本项目自身实现。
+
 ## 开发与测试
 
 ```bash
