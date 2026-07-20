@@ -1,0 +1,22 @@
+{
+  "name": "EchoMusic 酷狗奖励插件源",
+  "homepage": "https://github.com/DeH40/echomusic-kugou-reward",
+  "plugins": [
+    {
+      "id": "echomusic",
+      "name": "EchoMusic 酷狗奖励",
+      "description": "自动领取酷狗每日奖励、广告奖励，并在歌曲自然播放结束后上报听歌奖励。",
+      "author": "OpenAI",
+      "path": "",
+      "repo": "https://github.com/DeH40/echomusic-kugou-reward",
+      "homepage": "https://github.com/DeH40/echomusic-kugou-reward",
+      "tags": [
+        "酷狗",
+        "每日奖励",
+        "听歌奖励",
+        "广告奖励",
+        "自动化"
+      ]
+    }
+  ]
+}
