@@ -134,8 +134,9 @@ EchoMusic 插件目录/
 - [EchoMusic](https://github.com/hoowhoami/EchoMusic)：参考官方插件运行时提供的播放器事件、插件激活/卸载生命周期以及插件管理流程。
 - [EchoMusicPlugins](https://github.com/hoowhoami/EchoMusicPlugins)：参考官方 `echo-plugins.json` 的仓库索引结构、`path` / `repo` 用法和插件清单组织方式。
 - [EchoMusicPlugins 的 echo-plugins.json](https://raw.githubusercontent.com/hoowhoami/EchoMusicPlugins/HEAD/echo-plugins.json)：可直接查看官方插件源当前使用的索引示例。
+- [develop202/kgcheckin](https://github.com/develop202/kgcheckin)：酷狗概念 VIP 奖励流程的上游参考项目，参考了听歌奖励上报、每日 VIP 领取、广告播放上报、VIP 状态查询，以及相关请求参数和返回码处理。
 
-本项目根据上述公开接口和格式实现酷狗奖励功能，业务请求、任务账本和界面代码均属于本项目自身实现。
+本插件是在上述公开项目和 EchoMusic 插件接口基础上的改造版本；请求网关、任务账本、生命周期接入、界面和自动化控制由本项目重新适配实现。
 
 ## 开发与测试
 
