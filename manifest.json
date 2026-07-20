@@ -1,12 +1,12 @@
 {
   "id": "echomusic",
   "name": "EchoMusic 酷狗奖励",
-  "version": "0.4.0",
-  "description": "在 EchoMusic 中自动完成酷狗签到、可停止的广告上报与听歌奖励领取",
+  "version": "0.5.0",
+  "description": "在 EchoMusic 中自动补领酷狗每日奖励、广告奖励与听歌上报",
   "author": "OpenAI",
   "main": "index.js",
   "path": "echomusic",
-  "tags": ["酷狗", "签到", "听歌奖励", "广告领取", "自动化"],
+  "tags": ["酷狗", "每日奖励", "听歌上报", "广告奖励", "自动化"],
   "capabilities": {
     "kugouApi": true
   },
